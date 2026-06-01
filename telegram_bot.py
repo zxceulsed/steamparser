@@ -46,6 +46,8 @@ class Settings:
     db_path: str = "steam_bot.sqlite3"
     check_interval_seconds: int = 300
     stats_interval_seconds: int = 3600
+    error_alert_threshold: int = 3
+    error_alert_interval_seconds: int = 3600
     expected_currency_id: int | None = DEFAULT_EXPECT_CURRENCY_ID
     default_limit: int = 20
 
@@ -150,6 +152,8 @@ def load_settings() -> Settings:
         db_path=os.environ.get("STEAM_BOT_DB", "steam_bot.sqlite3"),
         check_interval_seconds=int(os.environ.get("CHECK_INTERVAL_SECONDS", "300")),
         stats_interval_seconds=int(os.environ.get("STATS_INTERVAL_SECONDS", "3600")),
+        error_alert_threshold=int(os.environ.get("ERROR_ALERT_THRESHOLD", "3")),
+        error_alert_interval_seconds=int(os.environ.get("ERROR_ALERT_INTERVAL_SECONDS", "3600")),
         expected_currency_id=expected_currency_id,
         default_limit=int(os.environ.get("DEFAULT_LISTING_LIMIT", "20")),
     )
@@ -191,6 +195,8 @@ class Database:
                 checks_count INTEGER NOT NULL DEFAULT 0,
                 matches_count INTEGER NOT NULL DEFAULT 0,
                 error_count INTEGER NOT NULL DEFAULT 0,
+                consecutive_error_count INTEGER NOT NULL DEFAULT 0,
+                last_error_alert_at INTEGER,
                 last_error TEXT
             );
 
@@ -202,6 +208,20 @@ class Database:
             );
             """
         )
+        self.conn.commit()
+        self.migrate_schema()
+
+    def migrate_schema(self) -> None:
+        watch_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(watches)").fetchall()
+        }
+        if "consecutive_error_count" not in watch_columns:
+            self.conn.execute(
+                "ALTER TABLE watches ADD COLUMN consecutive_error_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_error_alert_at" not in watch_columns:
+            self.conn.execute("ALTER TABLE watches ADD COLUMN last_error_alert_at INTEGER")
         self.conn.commit()
 
     def touch_user(self, telegram_id: int) -> None:
@@ -336,6 +356,7 @@ class Database:
             SET item_name = ?,
                 checks_count = checks_count + 1,
                 matches_count = matches_count + ?,
+                consecutive_error_count = 0,
                 last_checked_at = ?,
                 last_status = 'ok',
                 last_error = NULL,
@@ -346,12 +367,13 @@ class Database:
         )
         self.conn.commit()
 
-    def mark_watch_error(self, watch_id: int, error: str) -> None:
+    def mark_watch_error(self, watch_id: int, error: str) -> sqlite3.Row | None:
         self.conn.execute(
             """
             UPDATE watches
             SET checks_count = checks_count + 1,
                 error_count = error_count + 1,
+                consecutive_error_count = consecutive_error_count + 1,
                 last_checked_at = ?,
                 last_status = 'error',
                 last_error = ?,
@@ -359,6 +381,21 @@ class Database:
             WHERE id = ?
             """,
             (now_ts(), error[:500], now_ts(), watch_id),
+        )
+        self.conn.commit()
+        return self.conn.execute(
+            "SELECT * FROM watches WHERE id = ?",
+            (watch_id,),
+        ).fetchone()
+
+    def mark_error_alert_sent(self, watch_id: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE watches
+            SET last_error_alert_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now_ts(), now_ts(), watch_id),
         )
         self.conn.commit()
 
@@ -531,6 +568,7 @@ def render_listing(row: sqlite3.Row) -> str:
         f"checks: <code>{row['checks_count']}</code>, "
         f"matches: <code>{row['matches_count']}</code>, "
         f"errors: <code>{row['error_count']}</code>, "
+        f"streak: <code>{row['consecutive_error_count']}</code>, "
         f"last: <code>{escape(last_status)}</code>"
     )
 
@@ -598,6 +636,33 @@ async def notify_match(bot: Bot, row: sqlite3.Row, market_data: dict[str, Any], 
     await bot.send_message(row["telegram_id"], text, reply_markup=main_keyboard())
 
 
+def should_send_error_alert(row: sqlite3.Row, settings: Settings) -> bool:
+    if row["consecutive_error_count"] < settings.error_alert_threshold:
+        return False
+
+    last_alert_at = row["last_error_alert_at"]
+    if not last_alert_at:
+        return True
+    return now_ts() - last_alert_at >= settings.error_alert_interval_seconds
+
+
+async def notify_watch_error(bot: Bot, row: sqlite3.Row, settings: Settings) -> None:
+    if not should_send_error_alert(row, settings):
+        return
+
+    text = (
+        "<b>Watch error alert</b>\n"
+        f"watch: <code>#{row['id']}</code>\n"
+        f"item: <b>{escape(row['item_name'] or 'unknown item')}</b>\n"
+        f"errors in a row: <code>{row['consecutive_error_count']}</code>\n"
+        f"total errors: <code>{row['error_count']}</code>\n"
+        f"last error: <code>{escape(row['last_error'])}</code>\n\n"
+        "Бот жив, но этот watch не проверяется нормально. "
+        "Чаще всего это cookies, валюта, бан/rate limit или изменение ответа Steam."
+    )
+    await bot.send_message(row["telegram_id"], text, reply_markup=main_keyboard())
+
+
 async def check_watch(bot: Bot, db: Database, row: sqlite3.Row, settings: Settings) -> None:
     try:
         market_data = await fetch_market_data(row, settings.expected_currency_id)
@@ -613,7 +678,11 @@ async def check_watch(bot: Bot, db: Database, row: sqlite3.Row, settings: Settin
         db.mark_watch_ok(row["id"], str(market_data.get("item_name") or row["item_name"]), new_matches)
     except (ParserError, OSError, RuntimeError) as exc:
         logging.exception("Watch %s failed", row["id"])
-        db.mark_watch_error(row["id"], str(exc))
+        error_row = db.mark_watch_error(row["id"], str(exc))
+        if error_row is not None:
+            await notify_watch_error(bot, error_row, settings)
+            if should_send_error_alert(error_row, settings):
+                db.mark_error_alert_sent(row["id"])
 
 
 async def run_checks(bot: Bot, db: Database, settings: Settings) -> None:
