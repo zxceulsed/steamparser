@@ -2,7 +2,7 @@
 """Aiogram bot for monitoring Steam Market listings per Telegram user."""
 
 from __future__ import annotations
-
+import aiohttp
 import asyncio
 import html
 import json
@@ -19,6 +19,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.client.session.aiohttp import AiohttpSession
+
+
 
 from steam_market_parser import (
     DEFAULT_EXPECT_CURRENCY_ID,
@@ -935,12 +938,16 @@ def build_router(db: Database, settings: Settings) -> Router:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    session = AiohttpSession(timeout=aiohttp.ClientTimeout(total=60))
     settings = load_settings()
     db = Database(settings.db_path)
     bot = Bot(
         token=settings.bot_token,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+    
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(db, settings))
 
