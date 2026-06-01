@@ -938,7 +938,7 @@ def build_router(db: Database, settings: Settings) -> Router:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    session = AiohttpSession(timeout=aiohttp.ClientTimeout(total=60))
+    session = AiohttpSession(timeout=60)
     settings = load_settings()
     db = Database(settings.db_path)
     bot = Bot(
