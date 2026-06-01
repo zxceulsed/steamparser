@@ -938,7 +938,7 @@ def build_router(db: Database, settings: Settings) -> Router:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    session = AiohttpSession(timeout=60)
+    session = AiohttpSession()  # без timeout
     settings = load_settings()
     db = Database(settings.db_path)
     bot = Bot(
@@ -946,6 +946,14 @@ async def main() -> None:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_router(db, settings))
+    scheduler_task = asyncio.create_task(scheduler(bot, db, settings))
+    try:
+        await dispatcher.start_polling(bot, request_timeout=60)  # timeout сюда
+    finally:
+        scheduler_task.cancel()
+        await bot.session.close()
 
     
     dispatcher = Dispatcher()
